@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -243,6 +244,7 @@ def collect_messages(
                     "ts": message.get("ts") or "",
                     "user_id": author,
                     "user": names.get(author) or message.get("subtype") or message.get("bot_id") or author or "系统",
+                    "thread_ts": message.get("thread_ts") or "",
                     "text": text.replace("\n", " "),
                 }
             )
@@ -297,7 +299,7 @@ def poll(token: str, channel: str) -> int:
             print(f"{local_time(item['ts'])}  {kind}  {item['user']}  {item['text']}", flush=True)
             print("─" * 48, flush=True)
     seen_path.write_text("\n".join(sorted(seen)) + "\n")
-    return 0
+    return fresh[0] if fresh else None
 
 
 def print_context_line(item: dict) -> None:
@@ -337,6 +339,10 @@ def show_startup_context(token: str, channel: str) -> None:
         if item.get("ts"):
             seen.add(item["ts"])
     seen_path.write_text("\n".join(sorted(seen)) + "\n")
+    shown = list(cached) + list(new_items)
+    if not shown:
+        return None
+    return max(shown, key=lambda item: float(item.get("ts") or 0))
 
 
 def watch(token: str, channel: str, every: int) -> int:
@@ -349,36 +355,69 @@ def watch(token: str, channel: str, every: int) -> int:
         f"结果显示在这个终端，并写入 {STATE / 'mentions.jsonl'}。Ctrl-C 停止。",
         flush=True,
     )
-    show_startup_context(token, channel)
-    try:
-        while True:
+    latest = {"item": show_startup_context(token, channel)}
+    lock = threading.Lock()
+    stop = threading.Event()
+
+    def refresh() -> None:
+        while not stop.is_set():
             try:
-                poll(token, channel)
+                item = poll(token, channel)
+                if item:
+                    with lock:
+                        latest["item"] = item
             except (RuntimeError, urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
                 print(str(error), flush=True)
-            sys.stdout.flush()
-            time.sleep(every)
-    except KeyboardInterrupt:
+            stop.wait(every)
+
+    threading.Thread(target=refresh, daemon=True).start()
+    print("回复最新一条后回车。空行不发送。Ctrl-C 停止。", flush=True)
+    try:
+        while True:
+            text = input("回复> ")
+            if not text.strip():
+                continue
+            with lock:
+                item = latest["item"]
+            if not item:
+                print("还没有可回复的消息。", flush=True)
+                continue
+            if send(token, channel, text, [], thread_ts=item.get("thread_ts") or item.get("ts") or "", mention_ids=[item.get("user_id") or ""]) == 0:
+                print("已作为回复发送。", flush=True)
+    except (KeyboardInterrupt, EOFError):
+        stop.set()
         print("\n已停止。", flush=True)
         return 0
 
 
-def send(token: str, channel: str, text: str, ats: list[str]) -> int:
+def send(token: str, channel: str, text: str, ats: list[str], thread_ts: str = "", mention_ids: list[str] | None = None) -> int:
     body = text.strip()
     if not body:
         print("没有正文，没有发送。")
         return 1
     roster = members(token)
-    targets = ats or [DEFAULT_SEND_TO]
+    me_id = api(token, "auth.test", {}).get("user_id") or ""
+    targets = ats or ([DEFAULT_SEND_TO] if mention_ids is None else [])
     mentions = []
     for who in targets:
+        if not who:
+            continue
         uid = user_id(token, who, roster)
+        tag = f"<@{uid}>"
+        if tag not in body and tag not in mentions:
+            mentions.append(tag)
+    for uid in mention_ids or []:
+        if not uid or uid == me_id:
+            continue
         tag = f"<@{uid}>"
         if tag not in body and tag not in mentions:
             mentions.append(tag)
     posted = (" ".join(mentions) + " " + body).strip() if mentions else body
     cid, cname = channel_id(token, channel)
-    result = api(token, "chat.postMessage", {"channel": cid, "text": posted})
+    payload = {"channel": cid, "text": posted}
+    if thread_ts:
+        payload["thread_ts"] = thread_ts
+    result = api(token, "chat.postMessage", payload)
     if not result.get("ok"):
         print(f"没有发送：{result.get('error')}")
         return 1
