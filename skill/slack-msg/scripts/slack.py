@@ -81,10 +81,32 @@ def local_time(ts: str) -> str:
     return datetime.fromtimestamp(float(ts), TZ).strftime("%m-%d %H:%M")
 
 
+def cached_channel(name: str) -> tuple[str, str] | None:
+    path = STATE / "channels.json"
+    if not path.is_file():
+        return None
+    data = json.loads(path.read_text())
+    found = data.get(name.lower())
+    if not found:
+        return None
+    return found["id"], found["name"]
+
+
+def remember_channel(name: str, cid: str, cname: str) -> None:
+    STATE.mkdir(parents=True, exist_ok=True)
+    path = STATE / "channels.json"
+    data = json.loads(path.read_text()) if path.is_file() else {}
+    data[name.lower()] = {"id": cid, "name": cname}
+    path.write_text(json.dumps(data))
+
+
 def channel_id(token: str, channel: str) -> tuple[str, str]:
     name = channel.strip()
     if name.startswith("#"):
         name = name[1:]
+    cached = cached_channel(name)
+    if cached:
+        return cached
     channels = pages(
         token,
         "conversations.list",
@@ -98,7 +120,9 @@ def channel_id(token: str, channel: str) -> tuple[str, str]:
     wanted = name.lower()
     for item in channels:
         if item.get("id") == channel.strip() or (item.get("name") or "").lower() == wanted:
-            return item["id"], item.get("name") or name
+            cid, cname = item["id"], item.get("name") or name
+            remember_channel(name, cid, cname)
+            return cid, cname
     raise RuntimeError(f"找不到频道 {channel}")
 
 
@@ -144,20 +168,53 @@ def user_id(token: str, who: str, roster: list[dict]) -> str:
 STATE = Path.home() / ".local/state/slack-msg"
 
 
-def collect_messages(token: str, channel: str, mention: str, limit: int) -> tuple[str, list[dict], int]:
+def load_names() -> dict[str, str]:
+    path = STATE / "names.json"
+    if not path.is_file():
+        return {}
+    return json.loads(path.read_text())
+
+
+def save_names(names: dict[str, str]) -> None:
+    STATE.mkdir(parents=True, exist_ok=True)
+    (STATE / "names.json").write_text(json.dumps(names, ensure_ascii=False))
+
+
+def cached_history(channel: str, limit: int) -> list[dict]:
+    path = STATE / "mentions.jsonl"
+    if not path.is_file():
+        return []
+    by_ts: dict[str, dict] = {}
+    for line in path.read_text().splitlines():
+        if not line.strip():
+            continue
+        item = json.loads(line)
+        if channel and item.get("channel") not in (channel, f"#{channel}"):
+            continue
+        ts = item.get("ts")
+        if ts:
+            by_ts[ts] = item
+    return sorted(by_ts.values(), key=lambda item: float(item["ts"]))[-limit:]
+
+
+def collect_messages(token: str, channel: str, mention: str, limit: int, oldest: str = "") -> tuple[str, list[dict], int]:
     cid, cname = channel_id(token, channel)
     me = api(token, "auth.test", {})
     my_id = me.get("user_id") or ""
-    roster = members(token)
-    names = {member["id"]: display(member) for member in roster if member.get("id")}
+    names = load_names()
     wanted = ""
     if mention not in ("", "all"):
-        wanted = my_id if mention in ("me", "我") else user_id(token, mention, roster)
+        if mention in ("me", "我"):
+            wanted = my_id
+        else:
+            wanted = user_id(token, mention, members(token))
     collected = []
     cursor = ""
     scanned = 0
     while len(collected) < limit and scanned < 200:
         params = {"channel": cid, "limit": "100"}
+        if oldest:
+            params["oldest"] = oldest
         if cursor:
             params["cursor"] = cursor
         data = api(token, "conversations.history", params)
@@ -175,7 +232,8 @@ def collect_messages(token: str, channel: str, mention: str, limit: int) -> tupl
                     "channel": cname,
                     "channel_id": cid,
                     "ts": message.get("ts") or "",
-                    "user": names.get(author) or message.get("subtype") or message.get("bot_id") or "系统",
+                    "user_id": author,
+                    "user": names.get(author) or message.get("subtype") or message.get("bot_id") or author or "系统",
                     "text": text.replace("\n", " "),
                 }
             )
@@ -184,6 +242,15 @@ def collect_messages(token: str, channel: str, mention: str, limit: int) -> tupl
         cursor = (data.get("response_metadata") or {}).get("next_cursor") or ""
         if not cursor or not batch:
             break
+    unresolved = [item.get("user_id") or "" for item in collected if item.get("user_id") and item.get("user_id") not in names]
+    if unresolved:
+        roster = {member["id"]: display(member) for member in members(token) if member.get("id")}
+        names.update(roster)
+        save_names(names)
+        for item in collected:
+            author = item.get("user_id") or ""
+            if author in names:
+                item["user"] = names[author]
     return cname, collected, scanned
 
 
@@ -204,7 +271,8 @@ def poll(token: str, channel: str) -> int:
     STATE.mkdir(parents=True, exist_ok=True)
     seen_path = STATE / "seen.txt"
     seen = set(seen_path.read_text().split()) if seen_path.is_file() else set()
-    _cname, collected, scanned = collect_messages(token, channel, "me", 20)
+    oldest = max(seen, key=float) if seen else ""
+    _cname, collected, scanned = collect_messages(token, channel, "me", 20, oldest)
     fresh = [item for item in collected if item["ts"] and item["ts"] not in seen]
     stamp = datetime.now(TZ).strftime("%Y-%m-%d %H:%M")
     if not fresh:
@@ -219,25 +287,42 @@ def poll(token: str, channel: str) -> int:
     return 0
 
 
+def print_context_line(item: dict) -> None:
+    print(f"{local_time(item['ts'])}  {item['user']}  {item['text']}", flush=True)
+    print("─" * 48, flush=True)
+
+
 def show_startup_context(token: str, channel: str) -> None:
-    """First run only: print the latest 10 channel messages so the terminal has context."""
+    """Print cached history immediately, then ask Slack only for newer messages."""
     STATE.mkdir(parents=True, exist_ok=True)
-    cname, collected, _scanned = collect_messages(token, channel, "all", 10)
-    print(f"#{cname}  启动上下文，最近 10 条  清迈时间", flush=True)
-    if not collected:
-        print("没有历史消息。", flush=True)
-        return
+    cached = cached_history(channel, 10)
+    print(f"#{channel}  启动上下文，最近 10 条  清迈时间", flush=True)
+    if cached:
+        print("来自本地缓存", flush=True)
+        for item in cached:
+            print_context_line(item)
+        oldest = cached[-1]["ts"]
+    else:
+        oldest = ""
+        print("本地还没有缓存，正在向 Slack 取最近 10 条。", flush=True)
+    cname, fresh, _scanned = collect_messages(token, channel, "all", 10, oldest)
     seen_path = STATE / "seen.txt"
     seen = set(seen_path.read_text().split()) if seen_path.is_file() else set()
-    with (STATE / "mentions.jsonl").open("a", encoding="utf-8") as handle:
-        for item in reversed(collected):
-            item = dict(item)
-            item["context"] = True
-            handle.write(json.dumps(item, ensure_ascii=False) + "\n")
-            if item.get("ts"):
+    new_items = [item for item in fresh if item.get("ts") and item["ts"] not in {row.get("ts") for row in cached}]
+    if new_items:
+        print(f"#{cname}  缓存之后的新消息", flush=True)
+        with (STATE / "mentions.jsonl").open("a", encoding="utf-8") as handle:
+            for item in reversed(new_items):
+                item = dict(item)
+                item["context"] = True
+                handle.write(json.dumps(item, ensure_ascii=False) + "\n")
                 seen.add(item["ts"])
-            print(f"{local_time(item['ts'])}  {item['user']}  {item['text']}", flush=True)
-            print("─" * 48, flush=True)
+                print_context_line(item)
+    elif not cached:
+        print("没有历史消息。", flush=True)
+    for item in cached:
+        if item.get("ts"):
+            seen.add(item["ts"])
     seen_path.write_text("\n".join(sorted(seen)) + "\n")
 
 
