@@ -59,7 +59,10 @@ python3 ~/.agents/skills/slack-msg/scripts/slack.py fetch --channel pr --mention
 python3 ~/.agents/skills/slack-msg/scripts/slack.py fetch --mention all
 python3 ~/.agents/skills/slack-msg/scripts/slack.py send 已装好，这是测试回复
 python3 ~/.agents/skills/slack-msg/scripts/slack.py send --at 其他同学 晚上好
+python3 ~/.agents/skills/slack-msg/scripts/slack.py watch
 ```
+
+`watch` 在你启动它的那个终端里运行，不进 AI 对话。每 30 分钟收取 `#pr` 里 @ 自己的新消息，直接打在这个终端上，并追加到 `~/.local/state/slack-msg/mentions.jsonl`。`--every 秒数` 可改间隔。Ctrl-C 停止。
 
 - 不带参数：收取 `#pr` 里 @ 自己的消息。时间是清迈时间（UTC+7）。
 - `--channel` 换频道。`--mention all` 看该频道最近消息。`--mention 名字` 只看 @ 某个人的。

@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -140,7 +141,10 @@ def user_id(token: str, who: str, roster: list[dict]) -> str:
     raise RuntimeError(f"找不到这个人：{who}")
 
 
-def fetch(token: str, channel: str, mention: str, limit: int) -> int:
+STATE = Path.home() / ".local/state/slack-msg"
+
+
+def collect_messages(token: str, channel: str, mention: str, limit: int) -> tuple[str, list[dict], int]:
     cid, cname = channel_id(token, channel)
     me = api(token, "auth.test", {})
     my_id = me.get("user_id") or ""
@@ -158,8 +162,7 @@ def fetch(token: str, channel: str, mention: str, limit: int) -> int:
             params["cursor"] = cursor
         data = api(token, "conversations.history", params)
         if not data.get("ok"):
-            print(f"历史读取失败：{data.get('error')}")
-            return 1
+            raise RuntimeError(data.get("error") or "history failed")
         batch = data.get("messages") or []
         scanned += len(batch)
         for message in batch:
@@ -167,21 +170,70 @@ def fetch(token: str, channel: str, mention: str, limit: int) -> int:
             if wanted and f"<@{wanted}>" not in text:
                 continue
             author = message.get("user") or ""
-            who = names.get(author) or message.get("subtype") or message.get("bot_id") or "系统"
-            collected.append(f"{local_time(message['ts'])}  {who}  {text.replace(chr(10), ' ')}")
+            collected.append(
+                {
+                    "channel": cname,
+                    "channel_id": cid,
+                    "ts": message.get("ts") or "",
+                    "user": names.get(author) or message.get("subtype") or message.get("bot_id") or "系统",
+                    "text": text.replace("\n", " "),
+                }
+            )
             if len(collected) >= limit:
                 break
         cursor = (data.get("response_metadata") or {}).get("next_cursor") or ""
         if not cursor or not batch:
             break
-    label = "全部" if not wanted else ("@你" if wanted == my_id else f"@{mention}")
+    return cname, collected, scanned
+
+
+def fetch(token: str, channel: str, mention: str, limit: int) -> int:
+    cname, collected, scanned = collect_messages(token, channel, mention, limit)
+    label = "全部" if mention == "all" else ("@你" if mention in ("me", "我", "") else f"@{mention}")
     print(f"#{cname}  {label}  清迈时间  扫描 {scanned} 条")
     if not collected:
         print("没有符合条件的消息。")
         return 0
-    for line in reversed(collected):
-        print(line)
+    for item in reversed(collected):
+        print(f"{local_time(item['ts'])}  {item['user']}  {item['text']}")
     return 0
+
+
+def poll(token: str, channel: str) -> int:
+    """Standalone cron entry. Writes new @me messages to a local file. No model, no send."""
+    STATE.mkdir(parents=True, exist_ok=True)
+    seen_path = STATE / "seen.txt"
+    seen = set(seen_path.read_text().split()) if seen_path.is_file() else set()
+    _cname, collected, scanned = collect_messages(token, channel, "me", 20)
+    fresh = [item for item in collected if item["ts"] and item["ts"] not in seen]
+    stamp = datetime.now(TZ).strftime("%Y-%m-%d %H:%M")
+    if not fresh:
+        print(f"{stamp}  没有新的 @ 你的消息。扫描 {scanned} 条。", flush=True)
+        return 0
+    with (STATE / "mentions.jsonl").open("a", encoding="utf-8") as handle:
+        for item in reversed(fresh):
+            handle.write(json.dumps(item, ensure_ascii=False) + "\n")
+            seen.add(item["ts"])
+            print(f"{local_time(item['ts'])}  {item['user']}  {item['text']}", flush=True)
+    seen_path.write_text("\n".join(sorted(seen)) + "\n")
+    return 0
+
+
+def watch(token: str, channel: str, every: int) -> int:
+    """Foreground loop. Prints in the terminal that started it, and appends to a file."""
+    STATE.mkdir(parents=True, exist_ok=True)
+    print(
+        f"监听已启动。每 {every} 秒收取 #{channel} 里 @ 你的消息。"
+        f"结果显示在这个终端，并写入 {STATE / 'mentions.jsonl'}。Ctrl-C 停止。",
+        flush=True,
+    )
+    while True:
+        try:
+            poll(token, channel)
+        except (RuntimeError, urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
+            print(str(error), flush=True)
+        sys.stdout.flush()
+        time.sleep(every)
 
 
 def send(token: str, channel: str, text: str, ats: list[str]) -> int:
@@ -213,6 +265,7 @@ def usage() -> str:
     return """用法：
   python3 scripts/slack.py
   python3 scripts/slack.py fetch [--channel pr] [--mention me|all|名字] [--limit 10]
+  python3 scripts/slack.py watch [--every 1800]
   python3 scripts/slack.py send [--channel pr] [--at 名字]... 正文
 
 默认收取 #pr 里 @ 你的消息。默认发送到 #pr，并 @ David。可以重复 --at 再点名其他人。
@@ -249,6 +302,17 @@ def main(argv: list[str]) -> int:
             continue
         try:
             return fetch(token, channel, mention, limit)
+        except (RuntimeError, urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
+            print(str(error))
+            return 1
+    if argv[0] in ("poll", "watch"):
+        every = 1800
+        if len(argv) >= 3 and argv[1] == "--every":
+            every = max(30, int(argv[2]))
+        try:
+            if argv[0] == "watch":
+                return watch(token, default_channel, every)
+            return poll(token, default_channel)
         except (RuntimeError, urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
             print(str(error))
             return 1
