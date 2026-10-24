@@ -62,7 +62,7 @@ python3 ~/.agents/skills/slack-msg/scripts/slack.py send --at 其他同学 晚�
 python3 ~/.agents/skills/slack-msg/scripts/slack.py watch
 ```
 
-`watch` 在你启动它的那个终端里运行，不进 AI 对话。第一次先从本地文件显示最近 10 条，不等 Slack。再用最新一条的时间向 Slack 补新消息。之后默认每 7 分钟报 @ 自己的新消息，以及自己发出的消息，包括 @ 别人的。直接打在这个终端上，并追加到 `~/.local/state/slack-msg/mentions.jsonl`。`watch --30` 改成 30 分钟，`watch --every 90s` 按秒算。在 `回复>` 后输入文字回车，会回复当前最新一条，并 @ 对方。空行不发送。Ctrl-C 停止。
+`watch` 在你启动它的那个终端里运行，不进 AI 对话。第一次先从本地文件显示最近 10 条，不等 Slack。再用最新一条的时间向 Slack 补新消息。之后默认每 7 分钟报 @ 自己的新消息，以及自己发出的消息，包括 @ 别人的。直接打在这个终端上，并追加到 `~/.local/state/slack-msg/mentions.jsonl`。`watch --30` 改成 30 分钟，`watch --every 90s` 按秒算。在 `回复>` 后输入文字回车，会回复当前最新一条，并 @ 对方。这条回复会立刻写入本地对话。退出再进仍按时间顺序显示别人说的和你回的。空行不发送。Ctrl-C 停止。
 
 - 不带参数：收取 `#pr` 里 @ 自己的消息。时间是清迈时间（UTC+7）。
 - `--channel` 换频道。`--mention all` 看该频道最近消息。`--mention 名字` 只看 @ 某个人的。

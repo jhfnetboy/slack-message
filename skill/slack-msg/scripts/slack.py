@@ -303,17 +303,30 @@ def poll(token: str, channel: str) -> int:
 
 
 def print_context_line(item: dict) -> None:
-    print(f"{local_time(item['ts'])}  {item['user']}  {item['text']}", flush=True)
+    kind = item.get("kind") or ("你发出" if item.get("local_reply") else "")
+    prefix = f"{kind}  " if kind else ""
+    print(f"{local_time(item['ts'])}  {prefix}{item['user']}  {item['text']}", flush=True)
     print("─" * 48, flush=True)
+
+
+def remember_dialog(item: dict) -> None:
+    STATE.mkdir(parents=True, exist_ok=True)
+    with (STATE / "mentions.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(item, ensure_ascii=False) + "\n")
+    seen_path = STATE / "seen.txt"
+    seen = set(seen_path.read_text().split()) if seen_path.is_file() else set()
+    if item.get("ts"):
+        seen.add(item["ts"])
+    seen_path.write_text("\n".join(sorted(seen)) + "\n")
 
 
 def show_startup_context(token: str, channel: str) -> None:
     """Print cached history immediately, then ask Slack only for newer messages."""
     STATE.mkdir(parents=True, exist_ok=True)
     cached = cached_history(channel, 10)
-    print(f"#{channel}  启动上下文，最近 10 条  清迈时间", flush=True)
+    print(f"#{channel}  本地对话，最近 10 条  清迈时间", flush=True)
     if cached:
-        print("来自本地缓存", flush=True)
+        print("别人说的和你回的都在这里。退出再进仍按时间顺序显示。", flush=True)
         for item in cached:
             print_context_line(item)
         oldest = cached[-1]["ts"]
@@ -382,19 +395,31 @@ def watch(token: str, channel: str, every: int) -> int:
             if not item:
                 print("还没有可回复的消息。", flush=True)
                 continue
-            if send(token, channel, text, [], thread_ts=item.get("thread_ts") or item.get("ts") or "", mention_ids=[item.get("user_id") or ""]) == 0:
-                print("已作为回复发送。", flush=True)
+            code, record = send(
+                token,
+                channel,
+                text,
+                [],
+                thread_ts=item.get("thread_ts") or item.get("ts") or "",
+                mention_ids=[item.get("user_id") or ""],
+            )
+            if code == 0 and record:
+                remember_dialog(record)
+                print_context_line(record)
+                with lock:
+                    latest["item"] = record
+                print("已记入本地对话。", flush=True)
     except (KeyboardInterrupt, EOFError):
         stop.set()
         print("\n已停止。", flush=True)
         return 0
 
 
-def send(token: str, channel: str, text: str, ats: list[str], thread_ts: str = "", mention_ids: list[str] | None = None) -> int:
+def send(token: str, channel: str, text: str, ats: list[str], thread_ts: str = "", mention_ids: list[str] | None = None) -> tuple[int, dict | None]:
     body = text.strip()
     if not body:
         print("没有正文，没有发送。")
-        return 1
+        return 1, None
     roster = members(token)
     me_id = api(token, "auth.test", {}).get("user_id") or ""
     targets = ats or ([DEFAULT_SEND_TO] if mention_ids is None else [])
@@ -420,11 +445,22 @@ def send(token: str, channel: str, text: str, ats: list[str], thread_ts: str = "
     result = api(token, "chat.postMessage", payload)
     if not result.get("ok"):
         print(f"没有发送：{result.get('error')}")
-        return 1
+        return 1, None
     who = api(token, "auth.test", {})
+    record = {
+        "channel": cname,
+        "channel_id": cid,
+        "ts": result.get("ts") or "",
+        "user_id": me_id,
+        "user": who.get("user") or "你",
+        "text": posted,
+        "kind": "你发出",
+        "local_reply": True,
+        "reply_to": thread_ts,
+    }
     print(f"已发送到 #{cname}。身份 {who.get('user')}。ts {result.get('ts')}")
     print(posted)
-    return 0
+    return 0, record
 
 
 def interval_seconds(token: str) -> int:
@@ -523,7 +559,10 @@ def main(argv: list[str]) -> int:
         if not ats and default_at:
             ats = [default_at]
         try:
-            return send(token, channel, " ".join(words), ats)
+            code, record = send(token, channel, " ".join(words), ats)
+            if code == 0 and record:
+                remember_dialog(record)
+            return code
         except (RuntimeError, urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
             print(str(error))
             return 1
