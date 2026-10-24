@@ -237,6 +237,7 @@ def show_startup_context(token: str, channel: str) -> None:
             if item.get("ts"):
                 seen.add(item["ts"])
             print(f"{local_time(item['ts'])}  {item['user']}  {item['text']}", flush=True)
+            print("─" * 48, flush=True)
     seen_path.write_text("\n".join(sorted(seen)) + "\n")
 
 
