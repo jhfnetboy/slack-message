@@ -219,14 +219,38 @@ def poll(token: str, channel: str) -> int:
     return 0
 
 
+def show_startup_context(token: str, channel: str) -> None:
+    """First run only: print the latest 10 channel messages so the terminal has context."""
+    STATE.mkdir(parents=True, exist_ok=True)
+    cname, collected, _scanned = collect_messages(token, channel, "all", 10)
+    print(f"#{cname}  启动上下文，最近 10 条  清迈时间", flush=True)
+    if not collected:
+        print("没有历史消息。", flush=True)
+        return
+    seen_path = STATE / "seen.txt"
+    seen = set(seen_path.read_text().split()) if seen_path.is_file() else set()
+    with (STATE / "mentions.jsonl").open("a", encoding="utf-8") as handle:
+        for item in reversed(collected):
+            item = dict(item)
+            item["context"] = True
+            handle.write(json.dumps(item, ensure_ascii=False) + "\n")
+            if item.get("ts"):
+                seen.add(item["ts"])
+            print(f"{local_time(item['ts'])}  {item['user']}  {item['text']}", flush=True)
+    seen_path.write_text("\n".join(sorted(seen)) + "\n")
+
+
 def watch(token: str, channel: str, every: int) -> int:
     """Foreground loop. Prints in the terminal that started it, and appends to a file."""
     STATE.mkdir(parents=True, exist_ok=True)
+    minutes = every // 60
+    every_label = f"{minutes} 分钟" if every % 60 == 0 else f"{every} 秒"
     print(
-        f"监听已启动。每 {every} 秒收取 #{channel} 里 @ 你的消息。"
+        f"监听已启动。先显示最近 10 条，之后每 {every_label} 收取 #{channel} 里 @ 你的新消息。"
         f"结果显示在这个终端，并写入 {STATE / 'mentions.jsonl'}。Ctrl-C 停止。",
         flush=True,
     )
+    show_startup_context(token, channel)
     while True:
         try:
             poll(token, channel)
