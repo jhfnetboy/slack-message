@@ -261,14 +261,25 @@ def send(token: str, channel: str, text: str, ats: list[str]) -> int:
     return 0
 
 
+def interval_seconds(token: str) -> int:
+    text = token.strip().lower()
+    if text.endswith("s") and text[:-1].isdigit():
+        return max(30, int(text[:-1]))
+    if text.endswith("m") and text[:-1].isdigit():
+        return max(60, int(text[:-1]) * 60)
+    if text.isdigit():
+        return max(60, int(text) * 60)
+    raise RuntimeError(f"无法识别刷新时间：{token}。用 --30 表示 30 分钟。")
+
+
 def usage() -> str:
     return """用法：
   python3 scripts/slack.py
   python3 scripts/slack.py fetch [--channel pr] [--mention me|all|名字] [--limit 10]
-  python3 scripts/slack.py watch [--every 420]
+  python3 scripts/slack.py watch [--30]
   python3 scripts/slack.py send [--channel pr] [--at 名字]... 正文
 
-默认收取 #pr 里 @ 你的消息。默认发送到 #pr，并 @ David。可以重复 --at 再点名其他人。
+默认收取 #pr 里 @ 你的消息，watch 默认每 7 分钟。--30 表示 30 分钟。默认发送到 #pr，并 @ David。
 """
 
 
@@ -306,9 +317,20 @@ def main(argv: list[str]) -> int:
             print(str(error))
             return 1
     if argv[0] in ("poll", "watch"):
-        every = 420
-        if len(argv) >= 3 and argv[1] == "--every":
-            every = max(30, int(argv[2]))
+        every = 7 * 60
+        rest = argv[1:]
+        index = 0
+        while index < len(rest):
+            item = rest[index]
+            if item == "--every" and index + 1 < len(rest):
+                every = interval_seconds(rest[index + 1])
+                index += 2
+            elif item.startswith("--") and item[2:].isdigit():
+                every = interval_seconds(item[2:])
+                index += 1
+            else:
+                print(usage())
+                return 2
         try:
             if argv[0] == "watch":
                 return watch(token, default_channel, every)
