@@ -265,7 +265,7 @@ def usage() -> str:
     return """用法：
   python3 scripts/slack.py
   python3 scripts/slack.py fetch [--channel pr] [--mention me|all|名字] [--limit 10]
-  python3 scripts/slack.py watch [--every 1800]
+  python3 scripts/slack.py watch [--every 420]
   python3 scripts/slack.py send [--channel pr] [--at 名字]... 正文
 
 默认收取 #pr 里 @ 你的消息。默认发送到 #pr，并 @ David。可以重复 --at 再点名其他人。
@@ -306,7 +306,7 @@ def main(argv: list[str]) -> int:
             print(str(error))
             return 1
     if argv[0] in ("poll", "watch"):
-        every = 1800
+        every = 420
         if len(argv) >= 3 and argv[1] == "--every":
             every = max(30, int(argv[2]))
         try:
