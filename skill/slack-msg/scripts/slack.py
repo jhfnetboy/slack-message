@@ -197,7 +197,14 @@ def cached_history(channel: str, limit: int) -> list[dict]:
     return sorted(by_ts.values(), key=lambda item: float(item["ts"]))[-limit:]
 
 
-def collect_messages(token: str, channel: str, mention: str, limit: int, oldest: str = "") -> tuple[str, list[dict], int]:
+def collect_messages(
+    token: str,
+    channel: str,
+    mention: str,
+    limit: int,
+    oldest: str = "",
+    include_self: bool = False,
+) -> tuple[str, list[dict], int]:
     cid, cname = channel_id(token, channel)
     me = api(token, "auth.test", {})
     my_id = me.get("user_id") or ""
@@ -224,9 +231,11 @@ def collect_messages(token: str, channel: str, mention: str, limit: int, oldest:
         scanned += len(batch)
         for message in batch:
             text = message.get("text") or ""
-            if wanted and f"<@{wanted}>" not in text:
-                continue
             author = message.get("user") or ""
+            mentioned = not wanted or f"<@{wanted}>" in text
+            sent_by_me = include_self and bool(my_id) and author == my_id
+            if not mentioned and not sent_by_me:
+                continue
             collected.append(
                 {
                     "channel": cname,
@@ -272,17 +281,21 @@ def poll(token: str, channel: str) -> int:
     seen_path = STATE / "seen.txt"
     seen = set(seen_path.read_text().split()) if seen_path.is_file() else set()
     oldest = max(seen, key=float) if seen else ""
-    _cname, collected, scanned = collect_messages(token, channel, "me", 20, oldest)
+    _cname, collected, scanned = collect_messages(token, channel, "me", 20, oldest, include_self=True)
     fresh = [item for item in collected if item["ts"] and item["ts"] not in seen]
     stamp = datetime.now(TZ).strftime("%Y-%m-%d %H:%M")
     if not fresh:
-        print(f"{stamp}  没有新的 @ 你的消息。扫描 {scanned} 条。", flush=True)
+        print(f"{stamp}  没有新的对话消息。扫描 {scanned} 条。", flush=True)
         return 0
+    me_id = api(token, "auth.test", {}).get("user_id") or ""
     with (STATE / "mentions.jsonl").open("a", encoding="utf-8") as handle:
         for item in reversed(fresh):
+            kind = "你发出" if item.get("user_id") == me_id else "@你"
+            item["kind"] = kind
             handle.write(json.dumps(item, ensure_ascii=False) + "\n")
             seen.add(item["ts"])
-            print(f"{local_time(item['ts'])}  {item['user']}  {item['text']}", flush=True)
+            print(f"{local_time(item['ts'])}  {kind}  {item['user']}  {item['text']}", flush=True)
+            print("─" * 48, flush=True)
     seen_path.write_text("\n".join(sorted(seen)) + "\n")
     return 0
 
@@ -332,7 +345,7 @@ def watch(token: str, channel: str, every: int) -> int:
     minutes = every // 60
     every_label = f"{minutes} 分钟" if every % 60 == 0 else f"{every} 秒"
     print(
-        f"监听已启动。先显示最近 10 条，之后每 {every_label} 收取 #{channel} 里 @ 你的新消息。"
+        f"监听已启动。先显示最近 10 条，之后每 {every_label} 收取 #{channel} 里 @ 你的新消息，以及你自己发出的消息。"
         f"结果显示在这个终端，并写入 {STATE / 'mentions.jsonl'}。Ctrl-C 停止。",
         flush=True,
     )

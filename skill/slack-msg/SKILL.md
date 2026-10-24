@@ -35,7 +35,7 @@ python3 scripts/slack.py fetch --channel pr --mention me --limit 10
 python3 ~/.agents/skills/slack-msg/scripts/slack.py watch
 ```
 
-第一次启动先显示该频道最近 10 条历史，方便看上下文。之后只报新的 @ 你的消息，直接打在那个终端上，并追加到 `~/.local/state/slack-msg/mentions.jsonl`。默认 7 分钟一次。`--30` 改成 30 分钟，`--every 90s` 按秒算。
+第一次启动先显示该频道最近 10 条历史，方便看上下文。之后报新的 @ 你的消息，以及你自己在群里发出的消息，包括你 @ 别人的。直接打在那个终端上，并追加到 `~/.local/state/slack-msg/mentions.jsonl`。默认 7 分钟一次。`--30` 改成 30 分钟，`--every 90s` 按秒算。
 
 ## 发送
 
