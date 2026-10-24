@@ -251,13 +251,17 @@ def watch(token: str, channel: str, every: int) -> int:
         flush=True,
     )
     show_startup_context(token, channel)
-    while True:
-        try:
-            poll(token, channel)
-        except (RuntimeError, urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
-            print(str(error), flush=True)
-        sys.stdout.flush()
-        time.sleep(every)
+    try:
+        while True:
+            try:
+                poll(token, channel)
+            except (RuntimeError, urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
+                print(str(error), flush=True)
+            sys.stdout.flush()
+            time.sleep(every)
+    except KeyboardInterrupt:
+        print("\n已停止。", flush=True)
+        return 0
 
 
 def send(token: str, channel: str, text: str, ats: list[str]) -> int:
@@ -390,4 +394,8 @@ def main(argv: list[str]) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        print("\n已停止。", flush=True)
+        sys.exit(0)
