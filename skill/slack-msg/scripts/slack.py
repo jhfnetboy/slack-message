@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -277,29 +278,75 @@ def fetch(token: str, channel: str, mention: str, limit: int) -> int:
     return 0
 
 
-def poll(token: str, channel: str) -> int:
-    """Standalone cron entry. Writes new @me messages to a local file. No model, no send."""
+def is_bangkok_work_hours(dt: datetime | None = None) -> bool:
+    now = dt or datetime.now(TZ)
+    # 曼谷时间下午1:30开始，到晚上11点 (13:30 ~ 23:00)
+    current_minutes = now.hour * 60 + now.minute
+    return (13 * 60 + 30) <= current_minutes < (23 * 60)
+
+
+def get_sound_type() -> str:
+    if LOCAL_CONFIG.is_file():
+        try:
+            data = json.loads(LOCAL_CONFIG.read_text())
+            return data.get("sound") or "doorbell"
+        except Exception:
+            pass
+    return "doorbell"
+
+
+def play_alert_sound(sound_type: str = "") -> None:
+    try:
+        st = sound_type or get_sound_type()
+        sound_file = (
+            "/System/Library/Sounds/Ping.aiff"
+            if st == "doorbell"
+            else "/System/Library/Sounds/Pop.aiff"
+        )
+        if sys.platform == "darwin" and os.path.isfile(sound_file):
+            subprocess.Popen(
+                ["afplay", sound_file],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        else:
+            sys.stdout.write("\a")
+            sys.stdout.flush()
+    except Exception:
+        sys.stdout.write("\a")
+        sys.stdout.flush()
+
+
+def poll(token: str, channel: str) -> tuple[dict | None, int]:
+    """Standalone cron entry. Writes new messages in channel to local file. No model, no send."""
     STATE.mkdir(parents=True, exist_ok=True)
     seen_path = STATE / "seen.txt"
     seen = set(seen_path.read_text().split()) if seen_path.is_file() else set()
     oldest = max(seen, key=float) if seen else ""
-    _cname, collected, scanned = collect_messages(token, channel, "me", 20, oldest, include_self=True)
-    fresh = [item for item in collected if item["ts"] and item["ts"] not in seen]
+    cname, collected, scanned = collect_messages(token, channel, "all", 50, oldest, include_self=True)
+    fresh = [item for item in collected if item.get("ts") and item["ts"] not in seen]
     stamp = datetime.now(TZ).strftime("%Y-%m-%d %H:%M")
     if not fresh:
-        print(f"{stamp}  没有新的对话消息。扫描 {scanned} 条。", flush=True)
-        return 0
+        print(f"{stamp}  没有新的消息。扫描 {scanned} 条。", flush=True)
+        return None, 0
     me_id = api(token, "auth.test", {}).get("user_id") or ""
     with (STATE / "mentions.jsonl").open("a", encoding="utf-8") as handle:
         for item in reversed(fresh):
-            kind = "你发出" if item.get("user_id") == me_id else "@你"
+            author = item.get("user_id") or ""
+            if author == me_id:
+                kind = "你发出"
+            elif f"<@{me_id}>" in item.get("text", ""):
+                kind = "@你"
+            else:
+                kind = f"#{cname}"
             item["kind"] = kind
             handle.write(json.dumps(item, ensure_ascii=False) + "\n")
             seen.add(item["ts"])
             print(f"{local_time(item['ts'])}  {kind}  {item['user']}  {item['text']}", flush=True)
             print("─" * 48, flush=True)
     seen_path.write_text("\n".join(sorted(seen)) + "\n")
-    return fresh[0] if fresh else None
+    play_alert_sound()
+    return fresh[0] if fresh else None, len(fresh)
 
 
 def print_context_line(item: dict) -> None:
@@ -358,14 +405,13 @@ def show_startup_context(token: str, channel: str) -> None:
     return max(shown, key=lambda item: float(item.get("ts") or 0))
 
 
-def watch(token: str, channel: str, every: int) -> int:
+def watch(token: str, channel: str, initial_every: int | None = None, auto_backoff: bool = True) -> int:
     """Foreground loop. Prints in the terminal that started it, and appends to a file."""
     STATE.mkdir(parents=True, exist_ok=True)
-    minutes = every // 60
-    every_label = f"{minutes} 分钟" if every % 60 == 0 else f"{every} 秒"
     print(
-        f"监听已启动。先显示最近 10 条，之后每 {every_label} 收取 #{channel} 里 @ 你的新消息，以及你自己发出的消息。"
-        f"结果显示在这个终端，并写入 {STATE / 'mentions.jsonl'}。Ctrl-C 停止。",
+        f"监听已启动。先显示最近 10 条，收取 #{channel} 内全部新消息并记录到本地。"
+        f"\n扫描规则：曼谷时间 13:30-23:00 每 5 分钟扫描并提示声音；其他时间无消息自动降频 (5m->10m->15m...->30m)。"
+        f"\n结果写入 {STATE / 'mentions.jsonl'}。Ctrl-C 停止。",
         flush=True,
     )
     latest = {"item": show_startup_context(token, channel)}
@@ -373,15 +419,28 @@ def watch(token: str, channel: str, every: int) -> int:
     stop = threading.Event()
 
     def refresh() -> None:
+        interval = initial_every or (5 * 60)
         while not stop.is_set():
+            if auto_backoff:
+                if is_bangkok_work_hours():
+                    interval = 5 * 60
+            if stop.wait(interval):
+                break
             try:
-                item = poll(token, channel)
+                item, count = poll(token, channel)
                 if item:
                     with lock:
                         latest["item"] = item
+                if auto_backoff:
+                    if is_bangkok_work_hours():
+                        interval = 5 * 60
+                    else:
+                        if count > 0:
+                            interval = 5 * 60
+                        else:
+                            interval = min(30 * 60, interval + 5 * 60)
             except (RuntimeError, urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
                 print(str(error), flush=True)
-            stop.wait(every)
 
     threading.Thread(target=refresh, daemon=True).start()
     print("回复最新一条后回车。空行不发送。Ctrl-C 停止。", flush=True)
@@ -481,7 +540,7 @@ def usage() -> str:
   python3 scripts/slack.py watch [--30]
   python3 scripts/slack.py send [--channel pr] [--at 名字]... 正文
 
-默认收取 #pr 里 @ 你的消息，watch 默认每 7 分钟。--30 表示 30 分钟。默认发送到 #pr，并 @ David。
+默认收取 #pr 里 @ 你的消息。watch 收取该频道的新消息：曼谷时间 13:30–23:00 每 5 分钟，其余时间没有新消息就退避到 30 分钟。--30 或 --every 固定间隔。默认发送到 #pr，并 @ 配置里的 default_at。
 """
 
 
@@ -519,24 +578,28 @@ def main(argv: list[str]) -> int:
             print(str(error))
             return 1
     if argv[0] in ("poll", "watch"):
-        every = 7 * 60
+        every = None
+        auto_backoff = True
         rest = argv[1:]
         index = 0
         while index < len(rest):
             item = rest[index]
             if item == "--every" and index + 1 < len(rest):
                 every = interval_seconds(rest[index + 1])
+                auto_backoff = False
                 index += 2
             elif item.startswith("--") and item[2:].isdigit():
                 every = interval_seconds(item[2:])
+                auto_backoff = False
                 index += 1
             else:
                 print(usage())
                 return 2
         try:
             if argv[0] == "watch":
-                return watch(token, default_channel, every)
-            return poll(token, default_channel)
+                return watch(token, default_channel, every, auto_backoff=auto_backoff)
+            poll(token, default_channel)
+            return 0
         except (RuntimeError, urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
             print(str(error))
             return 1
