@@ -1,12 +1,21 @@
+use std::cmp::Ordering;
 use std::time::Duration;
 
 use reqwest::Client;
 use serde_json::Value;
 
 use crate::db::Store;
-use crate::model::{RawMessage, redact};
+use crate::model::{RawMessage, cmp_ts, redact};
 
 const API: &str = "https://slack.com/api/";
+
+#[derive(Clone, Debug)]
+pub struct HistoryPage {
+    pub messages: Vec<RawMessage>,
+    pub scanned: usize,
+    /// True when the cap stopped the walk before it reached `oldest` or the end.
+    pub truncated: bool,
+}
 
 #[derive(Clone)]
 pub struct SlackClient {
@@ -132,6 +141,7 @@ impl SlackClient {
                 .unwrap_or(false);
             db.save_user(id, name, real_name, display_name, deleted)?;
         }
+        db.mark_users_refreshed()?;
         Ok(())
     }
 
@@ -142,16 +152,45 @@ impl SlackClient {
         limit: usize,
         scan_cap: usize,
     ) -> Result<(Vec<RawMessage>, usize), String> {
-        let mut collected = Vec::new();
-        let mut scanned = 0;
+        let page = self
+            .history_range(channel_id, oldest, "", limit.min(scan_cap))
+            .await?;
+        Ok((page.messages, page.scanned))
+    }
+
+    /// Messages strictly after `oldest` and strictly before `latest`.
+    /// Slack's `oldest` and `latest` are exclusive. The page is newest-first.
+    pub async fn history_range(
+        &self,
+        channel_id: &str,
+        oldest: &str,
+        latest: &str,
+        scan_cap: usize,
+    ) -> Result<HistoryPage, String> {
+        if scan_cap == 0 {
+            return Ok(HistoryPage {
+                messages: Vec::new(),
+                scanned: 0,
+                truncated: false,
+            });
+        }
+        let mut messages = Vec::new();
+        let mut scanned = 0usize;
         let mut cursor = String::new();
-        while collected.len() < limit && scanned < scan_cap {
+        let mut caught_up = false;
+        for _ in 0..8 {
+            if messages.len() >= scan_cap {
+                break;
+            }
             let mut params = vec![
                 ("channel".to_string(), channel_id.to_string()),
                 ("limit".to_string(), "100".to_string()),
             ];
             if !oldest.is_empty() {
                 params.push(("oldest".to_string(), oldest.to_string()));
+            }
+            if !latest.is_empty() {
+                params.push(("latest".to_string(), latest.to_string()));
             }
             if !cursor.is_empty() {
                 params.push(("cursor".to_string(), cursor.clone()));
@@ -163,28 +202,78 @@ impl SlackClient {
                 .cloned()
                 .unwrap_or_default();
             if batch.is_empty() {
+                caught_up = true;
                 break;
             }
-            for item in batch {
+            let mut finished_batch = true;
+            for (index, item) in batch.iter().enumerate() {
                 scanned += 1;
-                if let Some(message) = parse_message(&item) {
-                    collected.push(message);
+                if let Some(message) = parse_message(item) {
+                    if !oldest.is_empty() && cmp_ts(&message.ts, oldest) != Ordering::Greater {
+                        caught_up = true;
+                        break;
+                    }
+                    if ts_in_window(&message.ts, oldest, latest) {
+                        messages.push(message);
+                    }
                 }
-                if collected.len() >= limit || scanned >= scan_cap {
+                if messages.len() >= scan_cap {
+                    finished_batch = index + 1 == batch.len();
                     break;
                 }
             }
-            cursor = data
-                .get("response_metadata")
-                .and_then(|item| item.get("next_cursor"))
-                .and_then(|item| item.as_str())
-                .unwrap_or("")
-                .to_string();
+            if caught_up {
+                break;
+            }
+            if !finished_batch {
+                break;
+            }
+            cursor = next_cursor(&data);
+            if cursor.is_empty() {
+                caught_up = true;
+                break;
+            }
+        }
+        Ok(HistoryPage {
+            messages,
+            scanned,
+            truncated: !caught_up,
+        })
+    }
+
+    pub async fn replies(
+        &self,
+        channel_id: &str,
+        thread_ts: &str,
+    ) -> Result<Vec<RawMessage>, String> {
+        let mut messages = Vec::new();
+        let mut cursor = String::new();
+        for _ in 0..4 {
+            let mut params = vec![
+                ("channel".to_string(), channel_id.to_string()),
+                ("ts".to_string(), thread_ts.to_string()),
+                ("limit".to_string(), "200".to_string()),
+            ];
+            if !cursor.is_empty() {
+                params.push(("cursor".to_string(), cursor.clone()));
+            }
+            let data = self.call("conversations.replies", params).await?;
+            let batch = data
+                .get("messages")
+                .and_then(|item| item.as_array())
+                .cloned()
+                .unwrap_or_default();
+            for item in batch {
+                if let Some(message) = parse_message(&item) {
+                    messages.push(message);
+                }
+            }
+            cursor = next_cursor(&data);
             if cursor.is_empty() {
                 break;
             }
         }
-        Ok((collected, scanned))
+        Ok(messages)
     }
 
     pub async fn post_message(
@@ -284,13 +373,33 @@ pub fn parse_message(value: &Value) -> Option<RawMessage> {
         .and_then(|item| item.as_str())
         .unwrap_or("")
         .to_string();
+    let reply_count = value
+        .get("reply_count")
+        .and_then(|item| item.as_u64())
+        .unwrap_or(0)
+        .min(u64::from(u32::MAX)) as u32;
     Some(RawMessage {
         ts: ts.to_string(),
         user_id,
         fallback_name: fallback_name(value),
         thread_ts,
         text: message_text(value),
+        reply_count,
     })
+}
+
+fn ts_in_window(ts: &str, oldest: &str, latest: &str) -> bool {
+    let after_oldest = oldest.is_empty() || cmp_ts(ts, oldest) == Ordering::Greater;
+    let before_latest = latest.is_empty() || cmp_ts(ts, latest) == Ordering::Less;
+    after_oldest && before_latest
+}
+
+fn next_cursor(data: &Value) -> String {
+    data.get("response_metadata")
+        .and_then(|item| item.get("next_cursor"))
+        .and_then(|item| item.as_str())
+        .unwrap_or("")
+        .to_string()
 }
 
 fn fallback_name(value: &Value) -> String {
@@ -374,6 +483,17 @@ mod tests {
         .unwrap();
         assert_eq!(message.text, "hello world");
         assert_eq!(message.thread_ts, "10.0");
+        assert_eq!(message.reply_count, 0);
+
+        let parent = parse_message(&json!({
+            "type": "message",
+            "user": "U1",
+            "text": "parent",
+            "ts": "9",
+            "reply_count": 2
+        }))
+        .unwrap();
+        assert_eq!(parent.reply_count, 2);
 
         let file = parse_message(&json!({
             "type": "message",
@@ -385,5 +505,13 @@ mod tests {
         .unwrap();
         assert_eq!(file.text, "[文件] a.png");
         assert!(parse_message(&json!({"subtype": "message_changed", "ts": "12"})).is_none());
+    }
+
+    #[test]
+    fn window_excludes_its_edges() {
+        assert!(ts_in_window("30", "20", "40"));
+        assert!(!ts_in_window("20", "20", "40"));
+        assert!(!ts_in_window("40", "20", "40"));
+        assert!(ts_in_window("30", "", ""));
     }
 }

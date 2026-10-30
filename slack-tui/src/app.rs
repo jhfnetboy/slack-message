@@ -6,10 +6,13 @@ use ratatui::widgets::ListState;
 
 use crate::db::Store;
 use crate::event::{AppEvent, Event, EventHandler};
-use crate::model::{Message, delete_word, redact};
+use crate::model::{
+    Message, backspace_at, char_len, delete_at, delete_word, insert_at, move_cursor, redact,
+    thread_root,
+};
 use crate::schedule::{MIN_SECS, ScanMode, next_interval};
 use crate::slack::SlackClient;
-use crate::sync::{send_text, sync_channel};
+use crate::sync::{send_text, sync_channel, sync_thread};
 use crate::timeutil::{SoundMode, bangkok_now, is_work_hours, play_alert_sound};
 use crate::ui;
 
@@ -28,6 +31,7 @@ pub enum Filter {
     Mentions,
     Mine,
     Search(String),
+    Thread(String),
 }
 
 impl Filter {
@@ -37,6 +41,7 @@ impl Filter {
             Self::Mentions => "@你".to_string(),
             Self::Mine => "你发出".to_string(),
             Self::Search(query) => format!("搜索 {query}"),
+            Self::Thread(_) => "线程".to_string(),
         }
     }
 
@@ -55,6 +60,7 @@ impl Filter {
                 message.text.to_lowercase().contains(&query)
                     || message.user_name.to_lowercase().contains(&query)
             }
+            Self::Thread(root) => thread_root(&message.thread_ts, &message.ts) == root,
         }
     }
 }
@@ -73,6 +79,7 @@ pub struct App {
     pub list_state: ListState,
     pub names: HashMap<String, String>,
     pub input: String,
+    pub cursor: usize,
     pub input_mode: InputMode,
     pub help: bool,
     pub filter: Filter,
@@ -130,6 +137,7 @@ impl App {
             list_state,
             names: args.names,
             input: String::new(),
+            cursor: 0,
             input_mode: InputMode::Normal,
             help: false,
             filter: Filter::All,
@@ -219,6 +227,7 @@ impl App {
             KeyCode::Char('c') => self.begin_channel(),
             KeyCode::Char('/') => self.begin_search(),
             KeyCode::Char('f') => self.cycle_filter(),
+            KeyCode::Char('t') => self.toggle_thread(),
             KeyCode::Char('s') => self.spawn_scan(),
             KeyCode::Char('m') => self.toggle_sound(),
             KeyCode::Char('?') => self.help = true,
@@ -229,25 +238,32 @@ impl App {
     fn handle_input(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Esc => {
-                self.input.clear();
+                self.reset_input();
                 self.input_mode = InputMode::Normal;
                 self.status = "已取消。".to_string();
             }
             KeyCode::Enter => self.submit_input(),
-            KeyCode::Backspace | KeyCode::Delete => {
-                self.input.pop();
+            KeyCode::Left => self.cursor = move_cursor(&self.input, self.cursor, -1),
+            KeyCode::Right => self.cursor = move_cursor(&self.input, self.cursor, 1),
+            KeyCode::Home => self.cursor = 0,
+            KeyCode::End => self.cursor = char_len(&self.input),
+            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => self.cursor = 0,
+            KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.cursor = char_len(&self.input)
             }
+            KeyCode::Backspace => backspace_at(&mut self.input, &mut self.cursor),
+            KeyCode::Delete => delete_at(&mut self.input, &mut self.cursor),
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.input.clear()
+                self.reset_input()
             }
             KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                delete_word(&mut self.input)
+                delete_word(&mut self.input, &mut self.cursor)
             }
             KeyCode::Char(ch)
                 if !key.modifiers.contains(KeyModifiers::CONTROL)
                     && !key.modifiers.contains(KeyModifiers::ALT) =>
             {
-                self.input.push(ch);
+                insert_at(&mut self.input, &mut self.cursor, ch);
             }
             _ => {}
         }
@@ -262,13 +278,13 @@ impl App {
                 } else {
                     Filter::Search(text)
                 };
-                self.input.clear();
+                self.reset_input();
                 self.input_mode = InputMode::Normal;
                 self.clamp_selection();
                 self.status = format!("筛选：{}", self.filter.label());
             }
             InputMode::Channel => {
-                self.input.clear();
+                self.reset_input();
                 self.input_mode = InputMode::Normal;
                 if text.is_empty() {
                     self.status = "没有频道名，没有切换。".to_string();
@@ -291,7 +307,7 @@ impl App {
                     self.status = "还没有可回复的消息。".to_string();
                     return;
                 }
-                self.input.clear();
+                self.reset_input();
                 self.input_mode = InputMode::Normal;
                 self.spawn_send(text, mode, selected);
             }
@@ -306,6 +322,7 @@ impl App {
                 self.on_channel_ready(generation, result)
             }
             AppEvent::SendDone(result) => self.on_send_done(result),
+            AppEvent::ThreadDone { generation, result } => self.on_thread_done(generation, result),
         }
     }
 
@@ -341,7 +358,7 @@ impl App {
                     self.fixed_secs,
                 );
                 self.countdown_secs = self.interval_secs;
-                self.status = if had_new {
+                let mut status = if had_new {
                     format!(
                         "新增 {} 条，扫描 {} 条。",
                         report.inserted.len(),
@@ -350,6 +367,10 @@ impl App {
                 } else {
                     format!("没有新的消息。扫描 {} 条。", report.scanned)
                 };
+                if report.catching_up {
+                    status.push_str("还有更早的消息，下次继续补。");
+                }
+                self.status = status;
             }
             Err(error) => {
                 self.countdown_secs = self.interval_secs.max(30);
@@ -389,7 +410,30 @@ impl App {
         }
     }
 
+    fn on_thread_done(&mut self, generation: u64, result: Result<Vec<Message>, String>) {
+        if generation != self.generation {
+            return;
+        }
+        match result {
+            Ok(messages) => {
+                let count = messages.len();
+                for message in &messages {
+                    self.fresh
+                        .insert(fresh_key(&message.channel_id, &message.ts));
+                }
+                self.reload_messages(false);
+                self.status = if count == 0 {
+                    "这个线程没有新回复。".to_string()
+                } else {
+                    format!("线程补了 {count} 条。")
+                };
+            }
+            Err(error) => self.status = format!("线程没有补上：{}", redact(&error)),
+        }
+    }
+
     fn reload_messages(&mut self, stick_to_bottom: bool) {
+        let selected_ts = self.selected_message().map(|message| message.ts);
         let follow = stick_to_bottom || self.at_bottom();
         if let Ok(names) = self.db.user_names() {
             self.names = names;
@@ -399,6 +443,10 @@ impl App {
         }
         if follow {
             self.follow_bottom();
+        } else if let Some(ts) = selected_ts.as_deref() {
+            if !self.select_ts(ts) {
+                self.clamp_selection();
+            }
         } else {
             self.clamp_selection();
         }
@@ -490,39 +538,74 @@ impl App {
         });
     }
 
+    fn spawn_thread(&mut self, root: String) {
+        let generation = self.generation;
+        let slack = self.slack.clone();
+        let db = self.db.clone();
+        let channel_id = self.channel_id.clone();
+        let channel_name = self.channel_name.clone();
+        let my_id = self.my_id.clone();
+        let tx = self.events.sender();
+        tokio::spawn(async move {
+            let result = sync_thread(&slack, &db, &channel_id, &channel_name, &my_id, &root).await;
+            let _ = tx.send(Event::App(AppEvent::ThreadDone { generation, result }));
+        });
+    }
+
     fn begin_reply(&mut self) {
         if self.selected_message().is_none() {
             self.status = "还没有可回复的消息。".to_string();
             return;
         }
         self.input_mode = InputMode::Reply;
-        self.input.clear();
+        self.reset_input();
         self.help = false;
     }
 
     fn begin_compose(&mut self) {
         self.input_mode = InputMode::Compose;
-        self.input.clear();
+        self.reset_input();
         self.help = false;
     }
 
     fn begin_channel(&mut self) {
         self.input_mode = InputMode::Channel;
-        self.input.clear();
+        self.reset_input();
         self.help = false;
     }
 
     fn begin_search(&mut self) {
         self.input_mode = InputMode::Search;
-        self.input.clear();
+        self.reset_input();
         self.help = false;
+    }
+
+    fn toggle_thread(&mut self) {
+        let Some(message) = self.selected_message() else {
+            self.status = "还没有可看的线程。".to_string();
+            return;
+        };
+        let root = thread_root(&message.thread_ts, &message.ts).to_string();
+        if matches!(&self.filter, Filter::Thread(current) if current == &root) {
+            self.filter = Filter::All;
+            self.select_ts(&message.ts);
+            self.status = "显示全部消息。".to_string();
+            return;
+        }
+        let ts = message.ts.clone();
+        self.filter = Filter::Thread(root.clone());
+        if !self.select_ts(&ts) {
+            self.clamp_selection();
+        }
+        self.status = "只看这个线程。再按 t 回到全部。".to_string();
+        self.spawn_thread(root);
     }
 
     fn cycle_filter(&mut self) {
         self.filter = match &self.filter {
             Filter::All => Filter::Mentions,
             Filter::Mentions => Filter::Mine,
-            Filter::Mine | Filter::Search(_) => Filter::All,
+            Filter::Mine | Filter::Search(_) | Filter::Thread(_) => Filter::All,
         };
         self.clamp_selection();
         self.status = format!("筛选：{}", self.filter.label());
@@ -544,6 +627,13 @@ impl App {
     pub fn selected_message(&self) -> Option<Message> {
         let index = self.list_state.selected()?;
         self.visible().into_iter().nth(index).cloned()
+    }
+
+    pub fn mention_count(&self) -> usize {
+        self.messages
+            .iter()
+            .filter(|message| message.kind == "@你")
+            .count()
     }
 
     pub fn is_fresh(&self, message: &Message) -> bool {
@@ -587,6 +677,19 @@ impl App {
             return;
         }
         self.list_state.select(Some(index.min(len - 1)));
+    }
+
+    fn select_ts(&mut self, ts: &str) -> bool {
+        let Some(index) = self.visible().iter().position(|message| message.ts == ts) else {
+            return false;
+        };
+        self.list_state.select(Some(index));
+        true
+    }
+
+    fn reset_input(&mut self) {
+        self.input.clear();
+        self.cursor = 0;
     }
 
     fn follow_bottom(&mut self) {

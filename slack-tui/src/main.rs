@@ -206,6 +206,9 @@ async fn poll(ctx: &Ctx, channel: &str) -> Result<(), String> {
     let stamp = format_clock(&bangkok_now());
     if report.inserted.is_empty() {
         println!("{stamp}  没有新的消息。扫描 {} 条。", report.scanned);
+        if report.catching_up {
+            println!("还有更早的消息，下次继续补。");
+        }
         return Ok(());
     }
     if !report.initial
@@ -218,6 +221,9 @@ async fn poll(ctx: &Ctx, channel: &str) -> Result<(), String> {
     }
     for message in report.inserted {
         print_message(&message);
+    }
+    if report.catching_up {
+        println!("还有更早的消息，下次继续补。");
     }
     Ok(())
 }
@@ -258,6 +264,9 @@ async fn watch(ctx: &Ctx, channel: &str, every: Option<u64>) -> Result<(), Strin
                 print_message(&message);
                 latest = Some(message);
             }
+            if report.catching_up {
+                emit("还有更早的消息，下次继续补。");
+            }
         }
         Err(error) => emit(&format!("扫描出错：{}", redact(&error))),
     }
@@ -283,6 +292,9 @@ async fn watch(ctx: &Ctx, channel: &str, every: Option<u64>) -> Result<(), Strin
                         for message in report.inserted {
                             print_message(&message);
                             latest = Some(message);
+                        }
+                        if report.catching_up {
+                            emit("还有更早的消息，下次继续补。");
                         }
                         interval = next_wait(mode, interval, fixed, had_new);
                     }

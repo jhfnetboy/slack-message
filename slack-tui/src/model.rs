@@ -23,6 +23,7 @@ pub struct RawMessage {
     pub fallback_name: String,
     pub thread_ts: String,
     pub text: String,
+    pub reply_count: u32,
 }
 
 pub fn classify(author: &str, my_id: &str, text: &str, channel_name: &str) -> String {
@@ -141,6 +142,103 @@ pub fn prettify(text: &str, names: &HashMap<String, String>) -> String {
     out
 }
 
+pub fn thread_root<'a>(thread_ts: &'a str, ts: &'a str) -> &'a str {
+    if thread_ts.is_empty() { ts } else { thread_ts }
+}
+
+pub fn min_ts<'a>(timestamps: impl IntoIterator<Item = &'a str>) -> Option<&'a str> {
+    timestamps
+        .into_iter()
+        .filter(|ts| !ts.is_empty())
+        .min_by(|left, right| cmp_ts(left, right))
+}
+
+/// Where the next scan should continue when a page stopped early.
+/// An empty result means the hole is closed.
+pub fn gap_after_sync(
+    saved_before: &str,
+    head_min: Option<&str>,
+    head_truncated: bool,
+    fill_min: Option<&str>,
+    fill_ran: bool,
+    fill_truncated: bool,
+) -> String {
+    let mut gap = String::new();
+    if head_truncated {
+        if let Some(ts) = head_min.filter(|ts| !ts.is_empty()) {
+            gap = ts.to_string();
+        }
+    }
+    if saved_before.is_empty() {
+        return gap;
+    }
+    if !fill_ran || fill_truncated {
+        gap = older_ts(&gap, saved_before);
+        if fill_truncated {
+            if let Some(ts) = fill_min.filter(|ts| !ts.is_empty()) {
+                gap = older_ts(&gap, ts);
+            }
+        }
+    }
+    gap
+}
+
+fn older_ts(current: &str, candidate: &str) -> String {
+    if current.is_empty() || cmp_ts(candidate, current) == std::cmp::Ordering::Less {
+        candidate.to_string()
+    } else {
+        current.to_string()
+    }
+}
+
+/// The hole still left after one scan.
+/// `floor` is the newest timestamp already contiguous; `edge` is the oldest timestamp
+/// the next fill must stay behind. An empty edge means the hole is closed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GapMark {
+    pub floor: String,
+    pub edge: String,
+}
+
+pub fn next_gap(
+    watermark: &str,
+    saved_floor: &str,
+    saved_edge: &str,
+    head_min: Option<&str>,
+    head_truncated: bool,
+    fill_min: Option<&str>,
+    fill_ran: bool,
+    fill_truncated: bool,
+) -> GapMark {
+    let edge = gap_after_sync(
+        saved_edge,
+        head_min,
+        head_truncated,
+        fill_min,
+        fill_ran,
+        fill_truncated,
+    );
+    if edge.is_empty() {
+        return GapMark {
+            floor: String::new(),
+            edge,
+        };
+    }
+    let mut floor = if !saved_floor.is_empty() && edge == saved_edge {
+        saved_floor.to_string()
+    } else if head_truncated && head_min == Some(edge.as_str()) {
+        watermark.to_string()
+    } else if !saved_floor.is_empty() {
+        saved_floor.to_string()
+    } else {
+        watermark.to_string()
+    };
+    if !floor.is_empty() && cmp_ts(&floor, &edge) != std::cmp::Ordering::Less {
+        floor.clear();
+    }
+    GapMark { floor, edge }
+}
+
 pub fn cmp_ts(left: &str, right: &str) -> std::cmp::Ordering {
     let left_n = left.parse::<f64>().ok();
     let right_n = right.parse::<f64>().ok();
@@ -154,14 +252,67 @@ pub fn cmp_ts(left: &str, right: &str) -> std::cmp::Ordering {
     }
 }
 
-pub fn delete_word(input: &mut String) {
-    let end = input.trim_end().len();
-    input.truncate(end);
-    if let Some(index) = input.rfind(char::is_whitespace) {
-        input.truncate(index + 1);
-    } else {
-        input.clear();
+pub fn char_len(text: &str) -> usize {
+    text.chars().count()
+}
+
+pub fn split_at_cursor(text: &str, cursor: usize) -> (String, String) {
+    let cursor = cursor.min(char_len(text));
+    let head: String = text.chars().take(cursor).collect();
+    let tail: String = text.chars().skip(cursor).collect();
+    (head, tail)
+}
+
+pub fn move_cursor(text: &str, cursor: usize, delta: isize) -> usize {
+    let len = char_len(text) as isize;
+    (cursor as isize + delta).clamp(0, len) as usize
+}
+
+pub fn insert_at(input: &mut String, cursor: &mut usize, ch: char) {
+    let mut chars: Vec<char> = input.chars().collect();
+    let index = (*cursor).min(chars.len());
+    chars.insert(index, ch);
+    *input = chars.into_iter().collect();
+    *cursor = index + 1;
+}
+
+pub fn backspace_at(input: &mut String, cursor: &mut usize) {
+    if *cursor == 0 {
+        return;
     }
+    let mut chars: Vec<char> = input.chars().collect();
+    let index = (*cursor).min(chars.len());
+    if index == 0 {
+        return;
+    }
+    chars.remove(index - 1);
+    *input = chars.into_iter().collect();
+    *cursor = index - 1;
+}
+
+pub fn delete_at(input: &mut String, cursor: &mut usize) {
+    let mut chars: Vec<char> = input.chars().collect();
+    if *cursor >= chars.len() {
+        return;
+    }
+    chars.remove(*cursor);
+    *input = chars.into_iter().collect();
+}
+
+pub fn delete_word(input: &mut String, cursor: &mut usize) {
+    let chars: Vec<char> = input.chars().collect();
+    let end = (*cursor).min(chars.len());
+    let mut index = end;
+    while index > 0 && chars[index - 1].is_whitespace() {
+        index -= 1;
+    }
+    while index > 0 && !chars[index - 1].is_whitespace() {
+        index -= 1;
+    }
+    let mut next = chars;
+    next.drain(index..end);
+    *input = next.into_iter().collect();
+    *cursor = index;
 }
 
 /// Hide Slack token material if a transport error echoes a request.
@@ -239,11 +390,72 @@ mod tests {
     }
 
     #[test]
-    fn deletes_the_last_word() {
+    fn deletes_the_word_before_the_cursor() {
         let mut text = "你好 world ".to_string();
-        delete_word(&mut text);
+        let mut cursor = char_len(&text);
+        delete_word(&mut text, &mut cursor);
         assert_eq!(text, "你好 ");
-        delete_word(&mut text);
+        delete_word(&mut text, &mut cursor);
         assert_eq!(text, "");
+        assert_eq!(cursor, 0);
+    }
+
+    #[test]
+    fn edits_around_a_cursor() {
+        let mut text = "ac".to_string();
+        let mut cursor = 1;
+        insert_at(&mut text, &mut cursor, 'b');
+        assert_eq!(text, "abc");
+        assert_eq!(cursor, 2);
+        backspace_at(&mut text, &mut cursor);
+        assert_eq!(text, "ac");
+        delete_at(&mut text, &mut cursor);
+        assert_eq!(text, "a");
+        let (head, tail) = split_at_cursor("你好", 1);
+        assert_eq!(head, "你");
+        assert_eq!(tail, "好");
+    }
+
+    #[test]
+    fn keeps_the_older_edge_of_a_truncated_page() {
+        assert_eq!(
+            gap_after_sync("", Some("50"), true, None, false, false),
+            "50"
+        );
+        assert_eq!(
+            gap_after_sync("", Some("50"), false, None, false, false),
+            ""
+        );
+        assert_eq!(
+            gap_after_sync("20", Some("50"), true, Some("30"), true, true),
+            "20"
+        );
+        assert_eq!(
+            gap_after_sync("20", Some("50"), false, Some("30"), true, false),
+            ""
+        );
+        assert_eq!(
+            gap_after_sync("20", Some("40"), true, Some("30"), true, false),
+            "40"
+        );
+    }
+
+    #[test]
+    fn remembers_the_floor_while_a_gap_walks_backward() {
+        let opened = next_gap("20", "", "", Some("50"), true, None, false, false);
+        assert_eq!(opened.edge, "50");
+        assert_eq!(opened.floor, "20");
+
+        let walked = next_gap("80", "20", "50", None, false, Some("30"), true, true);
+        assert_eq!(walked.edge, "30");
+        assert_eq!(walked.floor, "20");
+
+        let closed = next_gap("80", "20", "50", None, false, Some("30"), true, false);
+        assert_eq!(closed.edge, "");
+        assert_eq!(closed.floor, "");
+
+        let replaced = next_gap("20", "5", "10", Some("40"), true, Some("8"), true, false);
+        assert_eq!(replaced.edge, "40");
+        assert_eq!(replaced.floor, "20");
     }
 }

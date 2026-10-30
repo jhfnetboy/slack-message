@@ -8,6 +8,8 @@ use serde::Deserialize;
 
 use crate::model::Message;
 
+const USER_REFRESH_SECS: u64 = 6 * 60 * 60;
+
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS messages (
     channel_id TEXT NOT NULL,
@@ -115,6 +117,14 @@ impl Store {
         })
     }
 
+    pub fn clear_meta(&self, key: &str) -> Result<(), String> {
+        self.with(|conn| {
+            conn.execute("DELETE FROM meta WHERE key = ?1", params![key])
+                .map_err(|error| error.to_string())?;
+            Ok(())
+        })
+    }
+
     /// Insert a message. Returns true only when this timestamp was not stored before.
     pub fn put_message(&self, message: &Message) -> Result<bool, String> {
         self.with(|conn| {
@@ -184,6 +194,47 @@ impl Store {
             rows.reverse();
             Ok(rows)
         })
+    }
+
+    /// Newest thread root in the channel. A message with no `thread_ts` is its own root.
+    pub fn recent_thread_roots(
+        &self,
+        channel_id: &str,
+        channel_name: &str,
+        limit: usize,
+    ) -> Result<Vec<String>, String> {
+        self.with(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT CASE WHEN thread_ts != '' THEN thread_ts ELSE ts END AS root
+                     FROM messages
+                     WHERE channel_id = ?1 OR channel_name = ?2
+                     GROUP BY root
+                     ORDER BY MAX(CAST(ts AS REAL)) DESC
+                     LIMIT ?3",
+                )
+                .map_err(|error| error.to_string())?;
+            let rows = stmt
+                .query_map(params![channel_id, channel_name, limit as i64], |row| {
+                    row.get(0)
+                })
+                .map_err(|error| error.to_string())?
+                .collect::<Result<Vec<String>, _>>()
+                .map_err(|error| error.to_string())?;
+            Ok(rows)
+        })
+    }
+
+    pub fn users_stale(&self) -> Result<bool, String> {
+        let Some(value) = self.meta("users_refreshed_at")? else {
+            return Ok(true);
+        };
+        let saved = value.parse::<u64>().unwrap_or(0);
+        Ok(unix_secs().saturating_sub(saved) > USER_REFRESH_SECS)
+    }
+
+    pub fn mark_users_refreshed(&self) -> Result<(), String> {
+        self.set_meta("users_refreshed_at", &unix_secs().to_string())
     }
 
     pub fn newest_ts(
@@ -407,6 +458,13 @@ impl Store {
     }
 }
 
+fn unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
 fn init(conn: &Connection) -> Result<(), String> {
     conn.busy_timeout(std::time::Duration::from_secs(3))
         .map_err(|error| error.to_string())?;
@@ -581,6 +639,30 @@ mod tests {
         let rows = db.recent("C1", "pr", 10).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].channel_id, "C1");
+    }
+
+    #[test]
+    fn lists_thread_roots_by_the_newest_message() {
+        let db = Store::open_in_memory().unwrap();
+        db.put_message(&sample("C1", "10", "root")).unwrap();
+        let mut child = sample("C1", "12", "reply");
+        child.thread_ts = "10".into();
+        db.put_message(&child).unwrap();
+        db.put_message(&sample("C1", "30", "plain")).unwrap();
+        assert_eq!(
+            db.recent_thread_roots("C1", "pr", 8).unwrap(),
+            vec!["30".to_string(), "10".to_string()]
+        );
+    }
+
+    #[test]
+    fn refreshes_the_user_directory_after_six_hours() {
+        let db = Store::open_in_memory().unwrap();
+        assert!(db.users_stale().unwrap());
+        db.set_meta("users_refreshed_at", "1").unwrap();
+        assert!(db.users_stale().unwrap());
+        db.mark_users_refreshed().unwrap();
+        assert!(!db.users_stale().unwrap());
     }
 
     #[test]

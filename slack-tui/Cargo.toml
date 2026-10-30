@@ -1,6 +1,6 @@
 [package]
 name = "slack-tui"
-version = "0.1.0"
+version = "0.1.1"
 description = "Slack terminal UI with a local database"
 edition = "2024"
 publish = false

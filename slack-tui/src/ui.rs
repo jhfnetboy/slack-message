@@ -4,7 +4,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, List, ListItem, Paragraph, Wrap};
 
 use crate::app::{App, InputMode};
-use crate::model::prettify;
+use crate::model::{prettify, split_at_cursor};
 use crate::schedule::ScanMode;
 use crate::timeutil::{format_now, format_ts, is_work_hours};
 
@@ -40,6 +40,11 @@ pub fn draw(frame: &mut ratatui::Frame, app: &mut App) {
                 let fresh = app.is_fresh(message);
                 let text = prettify(&message.text, &app.names);
                 let mark = if fresh { "● " } else { "  " };
+                let reply = if !message.thread_ts.is_empty() && message.thread_ts != message.ts {
+                    "↳ "
+                } else {
+                    ""
+                };
                 let kind = if message.kind.is_empty() {
                     "#".to_string()
                 } else {
@@ -47,6 +52,7 @@ pub fn draw(frame: &mut ratatui::Frame, app: &mut App) {
                 };
                 ListItem::new(Line::from(vec![
                     Span::raw(mark),
+                    Span::raw(reply),
                     Span::styled(format!("{} ", format_ts(&message.ts)), Style::new().dim()),
                     Span::styled(format!("{kind} "), kind_style(&kind)),
                     Span::styled(
@@ -92,7 +98,8 @@ fn header(app: &App) -> Paragraph<'static> {
             Span::raw(format!("{}  ", app.my_name)),
             Span::styled(format_now(&app.now), Style::new().dim()),
             Span::raw(format!(
-                "  声音 {}  筛选 {}",
+                "  @你 {}  声音 {}  筛选 {}",
+                app.mention_count(),
                 app.sound.label(),
                 app.filter.label()
             )),
@@ -135,7 +142,7 @@ fn footer(app: &App) -> Paragraph<'static> {
         InputMode::Normal if app.help => (" 帮助 ", "Esc 关闭帮助    q 退出".to_string()),
         InputMode::Normal => (
             " 操作 ",
-            "j/k 移动  r 回复  i 新消息  c 频道  / 搜索  f 筛选  s 刷新  m 声音  ? 帮助  q 退出"
+            "j/k 移动  r 回复  i 新消息  t 线程  c 频道  / 搜索  f 筛选  s 刷新  m 声音  ? 帮助  q 退出"
                 .to_string(),
         ),
         InputMode::Reply => {
@@ -143,7 +150,7 @@ fn footer(app: &App) -> Paragraph<'static> {
                 .selected_message()
                 .map(|message| message.user_name)
                 .unwrap_or_else(|| "对方".into());
-            (" 回复 ", format!("回复 @{who}  {}_", app.input))
+            (" 回复 ", format!("回复 @{who}  {}", painted_input(app)))
         }
         InputMode::Compose => {
             let at = if app.default_at.is_empty() {
@@ -153,11 +160,11 @@ fn footer(app: &App) -> Paragraph<'static> {
             };
             (
                 " 新消息 ",
-                format!("#{}{at}  {}_", app.channel_name, app.input),
+                format!("#{}{at}  {}", app.channel_name, painted_input(app)),
             )
         }
-        InputMode::Channel => (" 频道 ", format!("{}_", app.input)),
-        InputMode::Search => (" 搜索 ", format!("{}_", app.input)),
+        InputMode::Channel => (" 频道 ", painted_input(app)),
+        InputMode::Search => (" 搜索 ", painted_input(app)),
     };
     Paragraph::new(text).block(block(title))
 }
@@ -165,18 +172,25 @@ fn footer(app: &App) -> Paragraph<'static> {
 fn help(app: &App) -> Paragraph<'static> {
     let text = format!(
         "本地数据库  {}\n\
-         启动先读本地，再向 Slack 补这个频道的消息。回复进线程并 @ 对方，新消息 @ 配置里的 default_at。\n\
+         启动先读本地，再向 Slack 补这个频道的消息。一次没取完的中间消息，下次继续补。\n\
+         线程里的新回复会跟在时间线上。t 只看当前线程，再按一次回到全部。回复进线程并 @ 对方，新消息 @ 配置里的 default_at。\n\
          空正文不会发送。不标已读，不加反应，不把令牌写进界面。\n\
          曼谷时间 13:30–23:00 每 5 分钟扫描并在有别人的新消息时出声。其余时间没有新消息就 5、10、15…直到 30 分钟。\n\
          --every 固定间隔，例如 --every 30m 或 --every 90s。\n\
          j/k 或方向键移动，g/G 到顶到底，Ctrl-u / Ctrl-d 翻页。\n\
-         输入时 Esc 取消，Enter 发送，Ctrl-u 清空，Ctrl-w 删掉最后一个词。\n\
+         输入时左右方向键移动光标，Home / End 到头尾，Backspace 删前面的字，Delete 删后面的字。\n\
+         Esc 取消，Enter 发送，Ctrl-u 清空，Ctrl-w 删掉光标前的一个词。\n\
          筛选在本地记录里进行：全部、@你、你发出，或 / 搜索。● 是这次打开后新到的消息。",
         app.db_path
     );
     Paragraph::new(text)
         .wrap(Wrap { trim: false })
         .block(block(" 帮助 "))
+}
+
+fn painted_input(app: &App) -> String {
+    let (head, tail) = split_at_cursor(&app.input, app.cursor);
+    format!("{head}█{tail}")
 }
 
 fn block(title: &str) -> Block<'static> {

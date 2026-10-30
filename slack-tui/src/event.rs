@@ -28,6 +28,10 @@ pub enum AppEvent {
         result: Result<(String, String), String>,
     },
     SendDone(Result<Message, String>),
+    ThreadDone {
+        generation: u64,
+        result: Result<Vec<Message>, String>,
+    },
 }
 
 pub struct EventHandler {
